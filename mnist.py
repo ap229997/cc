@@ -67,6 +67,7 @@ parser.add_argument('--fix-mod', dest='fix_mod', action='store_true', help='do n
 parser.add_argument('--wr', default=1., type=float, help='moderator regularization weight')
 
 parser.add_argument('--seed', default=0, type=int, help='seed for random functions, and network initialization')
+parser.add_argument('--log-path', type=str, required=True, help='path to store all logs')
 parser.add_argument('--log-summary', default='progress_log_summary.csv', metavar='PATH',
                     help='csv where to save per-epoch train and valid stats')
 parser.add_argument('--log-full', default='progress_log_full.csv', metavar='PATH',
@@ -102,7 +103,7 @@ class LeNet(nn.Module):
         return "LeNet"
 
 def mod_regularization_loss(pred_mod):
-    var_loss = torch.abs(F.sigmoid(pred_mod).var() - 0.25)
+    var_loss = torch.abs(torch.sigmoid(pred_mod).var() - 0.25)
     return F.relu(var_loss-0.05)
 
 def collaboration_loss(pred_mod, loss_alice, loss_bob):
@@ -134,7 +135,7 @@ def main():
     save_path = Path(args.name)
     args.data = Path(args.data)
 
-    args.save_path = 'checkpoints'/save_path #/timestamp
+    args.save_path = os.path.join(args.log_path, 'checkpoints'/save_path) #/timestamp
     print('=> will save everything to {}'.format(args.save_path))
     args.save_path.makedirs_p()
     torch.manual_seed(args.seed)
@@ -281,7 +282,7 @@ def main():
             if args.log_terminal:
                 logger.valid_writer.write(' * Avg {}'.format(error_string))
             else:
-                print('Epoch {} completed'.format(epoch))
+                print('Epoch {} completed with moderator loss {:.5f}'.format(epoch, errors[0]))
 
             for error, name in zip(errors, error_names):
                 training_writer.add_scalar(name, error, epoch)
@@ -356,9 +357,9 @@ def train(train_loader, alice_net, bob_net, mod_net, optimizer, epoch_size, logg
             elif args.fix_alice:
                 loss = loss_bob.mean()
             else:
-                if args.DEBUG: print("Training Both Alice and Bob")
+                # if args.DEBUG: print("Training Both Alice and Bob")
 
-                pred_mod_soft = Variable(F.sigmoid(pred_mod).data, requires_grad=False)
+                pred_mod_soft = Variable(torch.sigmoid(pred_mod).data, requires_grad=False)
                 loss = pred_mod_soft*loss_alice + (1-pred_mod_soft)*loss_bob
 
                 loss = loss.mean()
@@ -367,7 +368,7 @@ def train(train_loader, alice_net, bob_net, mod_net, optimizer, epoch_size, logg
             loss_alice2 = Variable(loss_alice.data, requires_grad = False)
             loss_bob2 = Variable(loss_bob.data, requires_grad = False)
 
-            loss1 = F.sigmoid(pred_mod)*loss_alice2 + (1-F.sigmoid(pred_mod))*loss_bob2
+            loss1 = torch.sigmoid(pred_mod)*loss_alice2 + (1-torch.sigmoid(pred_mod))*loss_bob2
 
             loss2 = collaboration_loss(pred_mod, loss_alice2, loss_bob2)
 
@@ -377,8 +378,8 @@ def train(train_loader, alice_net, bob_net, mod_net, optimizer, epoch_size, logg
         if i > 0 and n_iter % args.print_freq == 0:
             train_writer.add_scalar('loss_alice', loss_alice.mean().item(), n_iter)
             train_writer.add_scalar('loss_bob', loss_bob.mean().item(), n_iter)
-            train_writer.add_scalar('mod_mean', F.sigmoid(pred_mod).mean().item(), n_iter)
-            train_writer.add_scalar('mod_var', F.sigmoid(pred_mod).var().item(), n_iter)
+            train_writer.add_scalar('mod_mean', torch.sigmoid(pred_mod).mean().item(), n_iter)
+            train_writer.add_scalar('mod_var', torch.sigmoid(pred_mod).var().item(), n_iter)
             train_writer.add_scalar('loss_regularization', mod_regularization_loss(pred_mod).item(), n_iter)
 
             if mode=='compete':
@@ -426,22 +427,23 @@ def validate(val_loader, alice_net, bob_net, mod_net, epoch, logger=None, output
     end = time.time()
 
     for i, (img, target) in enumerate(val_loader):
-        img_var = Variable(img.cuda(), volatile=True)
-        target_var = Variable(target.cuda(), volatile=True)
+        with torch.no_grad():
+            img_var = Variable(img.cuda())
+            target_var = Variable(target.cuda())
 
-        pred_alice = alice_net(img_var)
-        pred_bob = bob_net(img_var)
-        pred_mod = F.sigmoid(mod_net(img_var))
+            pred_alice = alice_net(img_var)
+            pred_bob = bob_net(img_var)
+            pred_mod = torch.sigmoid(mod_net(img_var))
 
-        _ , pred_alice_label = torch.max(pred_alice.data, 1)
-        _ , pred_bob_label = torch.max(pred_bob.data, 1)
-        pred_label = (pred_mod.squeeze().data > 0.5).type_as(pred_alice_label) * pred_alice_label + (pred_mod.squeeze().data <= 0.5).type_as(pred_bob_label) * pred_bob_label
+            _ , pred_alice_label = torch.max(pred_alice.data, 1)
+            _ , pred_bob_label = torch.max(pred_bob.data, 1)
+            pred_label = (pred_mod.squeeze().data > 0.5).type_as(pred_alice_label) * pred_alice_label + (pred_mod.squeeze().data <= 0.5).type_as(pred_bob_label) * pred_bob_label
 
-        total_accuracy = (pred_label.cpu() == target).sum() / img.size(0)
-        alice_accuracy = (pred_alice_label.cpu() == target).sum() / img.size(0)
-        bob_accuracy = (pred_bob_label.cpu() == target).sum() / img.size(0)
+            total_accuracy = (pred_label.cpu() == target).sum() / img.size(0)
+            alice_accuracy = (pred_alice_label.cpu() == target).sum() / img.size(0)
+            bob_accuracy = (pred_bob_label.cpu() == target).sum() / img.size(0)
 
-        accuracy.update([total_accuracy, alice_accuracy, bob_accuracy])
+            accuracy.update([total_accuracy, alice_accuracy, bob_accuracy])
 
 
         # measure elapsed time
