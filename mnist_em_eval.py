@@ -26,6 +26,8 @@ from tensorboardX import SummaryWriter
 
 from utils import tensor2array, save_checkpoint
 
+# from mnist_em import AutoEncoder
+
 parser = argparse.ArgumentParser(description='MNIST and SVHN training',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('data', metavar='DIR',
@@ -35,12 +37,39 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
 parser.add_argument('-b', '--batch-size', default=100, type=int,
                     metavar='N', help='mini-batch size')
 
-parser.add_argument('--pretrained-alice', dest='pretrained_alice', default=None, metavar='PATH',
-                    help='path to pre-trained alice model')
-parser.add_argument('--pretrained-bob', dest='pretrained_bob', default=None, metavar='PATH',
-                    help='path to pre-trained bob model')
+parser.add_argument('--pretrained-autoencoder', dest='pretrained_autoencoder', default=None, metavar='PATH',
+                    help='path to pre-trained autoencoder')
 parser.add_argument('--pretrained-mod', dest='pretrained_mod', default=None, metavar='PATH',
                     help='path to pre-trained moderator')
+
+class AutoEncoder(nn.Module):
+    def __init__(self):
+        super(AutoEncoder, self).__init__()
+        self.conv1 = nn.Conv2d(1, 40, 3, 1, 1)
+        self.conv2 = nn.Conv2d(40, 40, 3, 1, 1)
+        self.fc1 = nn.Linear(40*7*7, 20)
+        self.fc2 = nn.Linear(20, 40*7*7)
+        self.deconv1 = nn.ConvTranspose2d(40, 40, 2, 2)
+        self.deconv2 = nn.ConvTranspose2d(40, 1, 2, 2)
+        # self.conv3 = nn.Conv2d(1, 1, 3, 1, 1)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, 2, 2)
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2, 2)
+        x = x.view(-1, 40*7*7)
+        x = self.fc1(x)
+        x = self.fc2(x)
+        x = x.view(-1, 40, 7, 7)
+        x = F.relu(self.deconv1(x))
+        x = F.relu(self.deconv2(x))
+        # x = F.relu(self.conv3(x))
+        return x
+
+    def name(self):
+        return "AutoEncoder"
+
 
 class LeNet(nn.Module):
     def __init__(self, nout=10):
@@ -98,32 +127,26 @@ def main():
 
     # create model
     print("=> creating model")
+    # define 10 autoencoder, 1 for each mnist class
+    autoencoder_list = nn.ModuleList([AutoEncoder() for i in range(10)])
+    mod_net = LeNet()
 
-    alice_net = LeNet()
-    bob_net = LeNet()
-    mod_net = LeNet(nout=1)
-
-    print("=> using pre-trained weights from {}".format(args.pretrained_alice))
-    weights = torch.load(args.pretrained_alice)
-    alice_net.load_state_dict(weights['state_dict'])
-
-    print("=> using pre-trained weights from {}".format(args.pretrained_bob))
-    weights = torch.load(args.pretrained_bob)
-    bob_net.load_state_dict(weights['state_dict'])
+    print("=> using pre-trained weights from {}".format(args.pretrained_autoencoder))
+    weights = torch.load(args.pretrained_autoencoder)
+    autoencoder_list.load_state_dict(weights['state_dict'])
 
     print("=> using pre-trained weights from {}".format(args.pretrained_mod))
     weights = torch.load(args.pretrained_mod)
     mod_net.load_state_dict(weights['state_dict'])
 
     cudnn.benchmark = True
-    alice_net = alice_net.cuda()
-    bob_net = bob_net.cuda()
+    autoencoder_list = autoencoder_list.cuda()
     mod_net = mod_net.cuda()
 
     # evaluate on validation set
-    errors_mnist, error_names_mnist, mod_count_mnist = validate(val_loader_mnist, alice_net, bob_net, mod_net)
-    errors_svhn, error_names_svhn, mod_count_svhn = validate(val_loader_svhn, alice_net, bob_net, mod_net)
-    errors_total, error_names_total, _ = validate(val_loader, alice_net, bob_net, mod_net)
+    errors_mnist, error_names_mnist, mod_count_mnist, autoencoder_class_mnist = validate(val_loader_mnist, autoencoder_list, mod_net)
+    errors_svhn, error_names_svhn, mod_count_svhn, autoencoder_class_svhn = validate(val_loader_svhn, autoencoder_list, mod_net)
+    errors_total, error_names_total, mod_count_total, autoencoder_class_total = validate(val_loader, autoencoder_list, mod_net)
 
     accuracy_string_mnist = ', '.join('{} : {:.3f}'.format(name, 100*(error)) for name, error in zip(error_names_mnist, errors_mnist))
     accuracy_string_svhn = ', '.join('{} : {:.3f}'.format(name, 100*(error)) for name, error in zip(error_names_svhn, errors_svhn))
@@ -131,44 +154,66 @@ def main():
 
     print("MNIST Error")
     print(accuracy_string_mnist)
-    print("MNIST Picking Percentage- Alice {:.3f}, Bob {:.3f}".format(mod_count_mnist[0]*100, (1-mod_count_mnist[0])*100))
+    for i in range(10): # hardcoded for 10 classes
+        print ("MNIST Picking Percentage - AutoEncoder_{}: {:.5f}, Class: {}".format(i, mod_count_mnist[i]*100, autoencoder_class_mnist[i]))
 
     print("SVHN Error")
     print(accuracy_string_svhn)
-    print("SVHN Picking Percentage for Alice {:.3f}, Bob {:.3f}".format(mod_count_svhn[0]*100, (1-mod_count_svhn[0])*100))
+    for i in range(10):
+        print ("SVHN Picking Percentage - AutoEncoder_{}: {:.5f}, Class: {}".format(i, mod_count_svhn[i]*100, autoencoder_class_svhn[i]))
 
     print("TOTAL Error")
     print(accuracy_string_total)
 
-def validate(val_loader, alice_net, bob_net, mod_net):
+def validate(val_loader, autoencoder_list, mod_net):
     global args
-    accuracy = AverageMeter(i=3, precision=4)
-    mod_count = AverageMeter()
+    accuracy = AverageMeter(i=1, precision=4)
+    mod_count = AverageMeter(i=10)
 
     # switch to evaluate mode
-    alice_net.eval()
-    bob_net.eval()
+    for model in autoencoder_list:
+        model.eval()
     mod_net.eval()
+
+    pred_mod_count = [[0]*10 for i in range(10)]
+    autoencoder_accuracy = []
+    autoencoder_class = []
 
     for i, (img, target) in enumerate(tqdm(val_loader)):
         with torch.no_grad():
             img_var = Variable(img.cuda())
             target_var = Variable(target.cuda())
 
-            pred_alice = alice_net(img_var)
-            pred_bob = bob_net(img_var)
-            pred_mod = torch.sigmoid(mod_net(img_var))
-            _ , pred_alice_label = torch.max(pred_alice.data, 1)
-            _ , pred_bob_label = torch.max(pred_bob.data, 1)
-            pred_label = (pred_mod.squeeze().data > 0.5).type_as(pred_alice_label) * pred_alice_label + (pred_mod.squeeze().data <= 0.5).type_as(pred_bob_label) * pred_bob_label
+            pred_autoencoder = []
+            for mode in autoencoder_list:
+                pred = model(img_var)
+                pred_autoencoder.append(pred)
+            
+            pred_mod = F.softmax(torch.sigmoid(mod_net(img_var)), dim=1)
+
+            _, pred_label = torch.max(pred_mod, 1)
+            pred_label = pred_label.squeeze().data
 
             total_accuracy = (pred_label.cpu() == target).sum().item() / img.size(0)
-            alice_accuracy = (pred_alice_label.cpu() == target).sum().item() / img.size(0)
-            bob_accuracy = (pred_bob_label.cpu() == target).sum().item() / img.size(0)
-            accuracy.update([total_accuracy, alice_accuracy, bob_accuracy])
-            mod_count.update((pred_mod.cpu().data > 0.5).sum().item() / img.size(0))
+            accuracy.update([total_accuracy])
+        
+        for i in range(img.size(0)):
+            pred_mod_count[int(pred_label[i])][int(target[i])] += 1
 
-    return list(map(lambda x: 1-x, accuracy.avg)), ['Total', 'alice', 'bob'] , mod_count.avg
+    
+    for i in range(10):
+        curr_arr = np.array(pred_mod_count[i])
+        max_class = np.argmax(curr_arr)
+        class_acc = np.max(curr_arr)/np.sum(curr_arr)
+        autoencoder_class.append(max_class)
+        autoencoder_accuracy.append(class_acc)
+
+    # pred_mod_count = [pred_mod_count[i]/img.size(0) for i in range(10)]
+    mod_count.update(autoencoder_accuracy)
+    # mod_count.update((pred_mod.cpu().data > 0.5).sum().item() / img.size(0))
+
+    return [1-accuracy.avg[0]], ['Total'], mod_count.avg, autoencoder_class
+    # return list(map(lambda x: 1-x, accuracy.avg)), ['Total', 'alice', 'bob'] , mod_count.avg
 
 
 

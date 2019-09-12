@@ -63,6 +63,10 @@ parser.add_argument('--fix-alice', dest='fix_alice', action='store_true', help='
 parser.add_argument('--fix-bob', dest='fix_bob', action='store_true', help='do not train bobnet')
 parser.add_argument('--fix-mod', dest='fix_mod', action='store_true', help='do not train moderator')
 parser.add_argument('--wr', default=1., type=float, help='moderator regularization weight')
+parser.add_argument('--wl1', default=1., type=float, help='collaboration loss1 weight')
+parser.add_argument('--wl2', default=1., type=float, help='collaboration loss2 weight')
+parser.add_argument('--wpv', default=1., type=float, help='pseudo_var_loss weight')
+parser.add_argument('--wmv', default=1., type=float, help='pred_var_loss weight')
 
 parser.add_argument('--seed', default=0, type=int, help='seed for random functions, and network initialization')
 parser.add_argument('--log-path', type=str, required=True, help='path to store all logs')
@@ -85,6 +89,8 @@ class AutoEncoder(nn.Module):
         super(AutoEncoder, self).__init__()
         self.conv1 = nn.Conv2d(1, 40, 3, 1, 1)
         self.conv2 = nn.Conv2d(40, 40, 3, 1, 1)
+        self.fc1 = nn.Linear(40*7*7, 20)
+        self.fc2 = nn.Linear(20, 40*7*7)
         self.deconv1 = nn.ConvTranspose2d(40, 40, 2, 2)
         self.deconv2 = nn.ConvTranspose2d(40, 1, 2, 2)
         # self.conv3 = nn.Conv2d(1, 1, 3, 1, 1)
@@ -94,6 +100,10 @@ class AutoEncoder(nn.Module):
         x = F.max_pool2d(x, 2, 2)
         x = F.relu(self.conv2(x))
         x = F.max_pool2d(x, 2, 2)
+        x = x.view(-1, 40*7*7)
+        x = self.fc1(x)
+        x = self.fc2(x)
+        x = x.view(-1, 40, 7, 7)
         x = F.relu(self.deconv1(x))
         x = F.relu(self.deconv2(x))
         # x = F.relu(self.conv3(x))
@@ -124,15 +134,21 @@ class LeNet(nn.Module):
         return "LeNet"
 
 def mod_regularization_loss(pred_mod):
-    var_loss = torch.abs(torch.sigmoid(pred_mod).var() - 0.09)
-    return F.relu(var_loss-0.02)
+    pred_soft = torch.softmax(torch.sigmoid(pred_mod), dim=1)
+    var_loss_1 = torch.abs(pred_soft.var(1)-0.09)
+    var_loss_0 = torch.abs(pred_soft.var(0)-0.09)
+    pred_soft_sum = pred_soft.sum(0)
+    pred_var_loss = pred_soft_sum.var()
+    return torch.mean(F.relu(var_loss_1-0.02)) + torch.mean(F.relu(var_loss_0-0.02)), pred_var_loss
 
 def collaboration_loss(pred_mod, loss_autoencoder):
     min_loss, min_index = torch.min(loss_autoencoder, 1)
     min_loss = torch.stack([min_loss]*10, 1) # hardcoded right now for 10 classes
     pseudo_label = (loss_autoencoder==min_loss).type_as(pred_mod)
     pseudo_label = Variable(pseudo_label.data).cuda()
-    return F.binary_cross_entropy_with_logits(pred_mod.squeeze(), pseudo_label)
+    pseudo_label_sum = pseudo_label.sum(0)
+    pseudo_var_loss = pseudo_label_sum.var()
+    return F.binary_cross_entropy_with_logits(pred_mod.squeeze(), pseudo_label), pseudo_var_loss
 
 def init_weights(m):
 
@@ -235,8 +251,9 @@ def main():
 
     if args.resume:
         print("=> resuming from checkpoint")
-        mod_weights = torch.load(args.save_path/'modnet_checkpoint.pth.tar')
-
+        weights = torch.load(args.save_path/'autoencoder_checkpoint.pth.tar')
+        autoencoder_list.load_state_dict(weights['state_dict'])
+        mod_weights = torch.load(args.save_path/'mod_checkpoint.pth.tar')
         mod_net.load_state_dict(mod_weights['state_dict'])
 
     cudnn.benchmark = True
@@ -300,7 +317,7 @@ def main():
             if args.log_terminal:
                 logger.valid_writer.write(' * Avg {}'.format(error_string))
             else:
-                print('Epoch {} completed with moderator loss {:.5f}'.format(epoch, errors[0]))
+                print('Epoch {} completed'.format(epoch))
 
             for error, name in zip(errors, error_names):
                 training_writer.add_scalar(name, error, epoch)
@@ -367,32 +384,39 @@ def train(train_loader, autoencoder_list, mod_net, optimizer, epoch_size, logger
         loss_autoencoder = torch.stack(loss_autoencoder, 1)
 
         if mode=='compete':
-            pred_mod_soft = Variable(torch.sigmoid(pred_mod).data, requires_grad=False)
-
+            pred_mod_soft = Variable(F.softmax(torch.sigmoid(pred_mod), dim=1).data, requires_grad=False)
+            # print (i, pred_mod_soft.shape, pred_mod_soft[0])
             loss = pred_mod_soft*loss_autoencoder
             loss = loss.mean()
 
         elif mode=='collaborate':
             loss_autoencoder = Variable(loss_autoencoder.data, requires_grad=False)
-
-            loss1 = torch.sigmoid(pred_mod)*loss_autoencoder
-
-            loss2 = collaboration_loss(pred_mod, loss_autoencoder)
-
-            loss = loss1.mean() + loss2.mean() + args.wr*mod_regularization_loss(pred_mod)
-
+            loss1 = F.softmax(torch.sigmoid(pred_mod), dim=1)*loss_autoencoder
+            loss2, pseudo_var_loss = collaboration_loss(pred_mod, loss_autoencoder)
+            regularizer_loss, pred_var_loss = mod_regularization_loss(pred_mod)
+            # added moderator loss weight here, softmax in regularizer term?
+            loss = args.wl1*loss1.mean() + args.wl2*loss2.mean() + args.wr*regularizer_loss + \
+                   args.wpv*pseudo_var_loss + args.wmv*pred_var_loss
+            # print ('collaborate loss1: ', loss1.shape, loss1.mean().item())
+            # print ('collaborate loss2: ', loss2.shape, loss2.mean().item())
+            # print ('collaborate regularizer: ', regularizer_loss.shape, regularizer_loss.item())
+            # print ('pseudo_var_loss: ', pseudo_var_loss.shape, pseudo_var_loss.item())
+            # print ('pred_var_loss: ', pred_var_loss.shape, pred_var_loss.item())
+            # print ('total collaborate loss: ', loss.shape, loss.item())
 
         if i > 0 and n_iter % args.print_freq == 0:
             for i in range(loss_autoencoder.shape[1]):
                 train_writer.add_scalar('loss_autoencoder_%d'%i, loss_autoencoder[:,i].mean().item(), n_iter)
             train_writer.add_scalar('mod_mean', torch.sigmoid(pred_mod).mean().item(), n_iter)
             train_writer.add_scalar('mod_var', torch.sigmoid(pred_mod).var().item(), n_iter)
-            train_writer.add_scalar('loss_regularization', mod_regularization_loss(pred_mod).item(), n_iter)
 
             if mode=='compete':
                 train_writer.add_scalar('competetion_loss', loss.item(), n_iter)
             elif mode=='collaborate':
                 train_writer.add_scalar('collaboration_loss', loss.item(), n_iter)
+                train_writer.add_scalar('pseudo_var_loss', pseudo_var_loss.item(), n_iter)
+                train_writer.add_scalar('pred_var_loss', pred_var_loss.item(), n_iter)
+                train_writer.add_scalar('loss_regularization', regularizer_loss.item(), n_iter)
 
         # record loss
         losses.update(loss.item(), args.batch_size)
@@ -463,7 +487,7 @@ def validate(val_loader, autoencoder_list, mod_net, epoch, logger=None, output_w
                 logger.valid_writer.write('valid: Time {} Accuray {}'.format(batch_time, accuracy))
 
     if args.log_output:
-        output_writer.add_scalar('accuracy_total', accuracy.avg[0]. epoch)
+        output_writer.add_scalar('accuracy_total', accuracy.avg[0], epoch)
 
     if args.log_terminal:
         logger.valid_bar.update(len(val_loader))
